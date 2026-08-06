@@ -483,9 +483,15 @@ def redact_by_coordinates(
             - page: Page number (0-indexed)
             - bbox: Bounding box as [x0, y0, x1, y1]
             - text: Optional overlay text for this specific redaction
+            - remove_text: Optional bool, default True. True is a text redaction: the
+              text under the rectangle is removed, while images and vector art under
+              it are left alone. False is a region redaction: the covered area of an
+              image is cleared and covered vector art is removed, while every glyph
+              the rectangle overlaps is left standing — the rectangle is about the
+              page's pixels, and the text it happens to cross belongs to no removal.
         fill_color: RGB color for redaction box (0-1 range). Default is black (0,0,0)
         overlay_text: Default text to display over redacted areas (can be overridden per redaction)
-    
+
     Returns:
         JSON string with summary of redactions applied
     """
@@ -498,12 +504,19 @@ def redact_by_coordinates(
         
         doc = DOCUMENT_STORE[document_id]
         applied_redactions = []
-        
+
+        # Pending annotations per page, split by remove_text. The two kinds are
+        # applied in separate passes with different modes, and apply_redactions
+        # consumes every annotation pending on the page, so they cannot be added
+        # to the page together.
+        pending: Dict[int, Dict[bool, List[Tuple[Any, Optional[str]]]]] = {}
+
         for redaction in redactions:
             page_num = redaction.get("page", 0)
             bbox = redaction.get("bbox")
             redact_text = redaction.get("text", overlay_text)
-            
+            remove_text = redaction.get("remove_text", True)
+
             if page_num < 0 or page_num >= len(doc):
                 applied_redactions.append({
                     "status": "error",
@@ -517,27 +530,68 @@ def redact_by_coordinates(
                     "message": "Invalid bbox format. Expected [x0, y0, x1, y1]"
                 })
                 continue
-            
-            page = doc[page_num]
-            rect = pymupdf.Rect(bbox)
-            
-            add_redact_annot_no_box(
-                page,
-                rect,
-                text=redact_text,
-                fill=fill_color
-            )
-            
+
+            # Not coerced: a truthy non-boolean would silently make a region
+            # redaction delete text it is only crossing.
+            if not isinstance(remove_text, bool):
+                applied_redactions.append({
+                    "status": "error",
+                    "message": "Invalid remove_text. Expected true or false"
+                })
+                continue
+
+            per_page = pending.setdefault(page_num, {True: [], False: []})
+            per_page[remove_text].append((pymupdf.Rect(bbox), redact_text))
+
             applied_redactions.append({
                 "page": page_num,
                 "bbox": bbox,
+                "remove_text": remove_text,
                 "status": "applied"
             })
-        
-        # Apply all redactions
-        for page in doc:
-            page.apply_redactions()
-        
+
+        # Apply all redactions, one pass per kind on each affected page
+        for page_num in sorted(pending):
+            page = doc[page_num]
+
+            text_pending = pending[page_num][True]
+            if text_pending:
+                for rect, redact_text in text_pending:
+                    add_redact_annot_no_box(
+                        page,
+                        rect,
+                        text=redact_text,
+                        fill=fill_color
+                    )
+                # The glyphs under the rectangle go. The page's pictures and line
+                # art are not what a text redaction was asked to take out, so they
+                # are left exactly as they were.
+                page.apply_redactions(
+                    text=pymupdf.PDF_REDACT_TEXT_REMOVE,
+                    images=pymupdf.PDF_REDACT_IMAGE_NONE,
+                    graphics=pymupdf.PDF_REDACT_LINE_ART_NONE
+                )
+
+            region_pending = pending[page_num][False]
+            if region_pending:
+                for rect, redact_text in region_pending:
+                    add_redact_annot_no_box(
+                        page,
+                        rect,
+                        text=redact_text,
+                        fill=fill_color
+                    )
+                # Pixels go and glyphs stay. IMAGE_PIXELS rewrites the picture with
+                # the covered area cleared rather than dropping the whole picture,
+                # LINE_ART_REMOVE_IF_COVERED catches art that is not an image at
+                # all, and TEXT_NONE leaves the text the rectangle merely overlaps,
+                # which no redaction here asked about.
+                page.apply_redactions(
+                    text=pymupdf.PDF_REDACT_TEXT_NONE,
+                    images=pymupdf.PDF_REDACT_IMAGE_PIXELS,
+                    graphics=pymupdf.PDF_REDACT_LINE_ART_REMOVE_IF_COVERED
+                )
+
         result = {
             "document_id": document_id,
             "total_redactions": len([r for r in applied_redactions if r.get("status") == "applied"]),

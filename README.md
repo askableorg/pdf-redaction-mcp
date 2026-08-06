@@ -236,7 +236,7 @@ Redact specific areas by their exact coordinates in a loaded PDF document.
 
 **Parameters:**
 - `document_id` (str): Identifier of the loaded document
-- `redactions` (List[Dict]): List of redaction areas with page, bbox, and optional text
+- `redactions` (List[Dict]): List of redaction areas with page, bbox, optional text, and optional `remove_text` (default `true`; `false` clears the covered pixels and vector art but leaves every glyph the rectangle overlaps standing)
 - `fill_color` (Tuple[float, float, float]): RGB colour
 - `overlay_text` (str): Default overlay text
 
