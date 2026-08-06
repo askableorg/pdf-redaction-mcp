@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **Region redactions no longer paint over standing text** — `redact_by_coordinates`
+  with `remove_text: false` used to create its annotations with `fill=fill_color`,
+  so applying the redaction painted the rectangle even though `PDF_REDACT_TEXT_NONE`
+  had deliberately left the overlapping text in place: the text stayed extractable
+  but was invisible under the fill. Region-pass annotations are now created with
+  `fill=False` (pymupdf treats `None` as default white; only `False` suppresses the
+  fill). `fill_color` now applies to text redactions (`remove_text: true`) only.
+
 ### Removed
 - **Base64 tools** - Removed all base64-encoded PDF tools as this MCP now only works with local files
   - Removed `extract_text_from_pdf_base64`

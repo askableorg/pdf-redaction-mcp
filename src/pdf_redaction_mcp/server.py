@@ -16,7 +16,7 @@ import json
 import uvicorn
 import argparse
 from pathlib import Path
-from typing import List, Dict, Any, Optional, Tuple
+from typing import List, Dict, Any, Literal, Optional, Tuple, Union
 from fastmcp import FastMCP
 from starlette.middleware.cors import CORSMiddleware
 from starlette.middleware import Middleware
@@ -77,7 +77,7 @@ def add_redact_annot_no_box(
     page: "pymupdf.Page",
     rect,
     text: Optional[str] = None,
-    fill: Optional[Tuple[float, float, float]] = None,
+    fill: Union[Tuple[float, float, float], Literal[False], None] = None,
     text_color: Optional[Tuple[float, float, float]] = None,
 ) -> "pymupdf.Annot":
     """Add a redaction annotation without the visible box preview.
@@ -89,6 +89,10 @@ def add_redact_annot_no_box(
     redactions render from the /IC (fill) and /OverlayText entries, not from
     this preview, so blanking it does not change the redacted output.
 
+    fill follows add_redact_annot's three-way contract (pymupdf 1.28:
+    ``if fill is None: fill = (1, 1, 1)`` then ``if fill:`` gates writing /IC in
+    Page._add_redact_annot): a colour tuple sets /IC, None means default white,
+    and only False leaves the /IC entry off entirely so the apply paints nothing.
     """
     annot = page.add_redact_annot(
         rect, text=text, fill=fill, text_color=text_color, cross_out=False
@@ -525,7 +529,10 @@ def redact_by_coordinates(
               image is cleared and covered vector art is removed, while every glyph
               the rectangle overlaps is left standing — the rectangle is about the
               page's pixels, and the text it happens to cross belongs to no removal.
-        fill_color: RGB color for redaction box (0-1 range). Default is black (0,0,0)
+        fill_color: RGB color for redaction box (0-1 range). Default is black (0,0,0).
+            Applies to text redactions only: their cleared rectangle is painted with
+            this colour. Region redactions are never filled — painting the rectangle
+            would cover the very text remove_text=false promises to leave standing.
         overlay_text: Default text to display over redacted areas (can be overridden per redaction)
 
     Returns:
@@ -612,11 +619,17 @@ def redact_by_coordinates(
 
             region_pending = pending[page_num][False]
             if region_pending:
+                # fill=False, not fill_color and not None: TEXT_NONE leaves the
+                # overlapping glyphs standing, and any /IC fill would paint over
+                # them on apply — text visibly destroyed while still extractable.
+                # In pymupdf's add_redact_annot only False suppresses the fill;
+                # None means default white (``if fill is None: fill = (1, 1, 1)``,
+                # verified against pymupdf 1.28.0).
                 for rect, _ in region_pending:
                     add_redact_annot_no_box(
                         page,
                         rect,
-                        fill=fill_color
+                        fill=False
                     )
                 # Pixels go and glyphs stay. IMAGE_PIXELS rewrites the picture with
                 # the covered area cleared rather than dropping the whole picture,
