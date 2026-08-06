@@ -38,6 +38,41 @@ PDF_BASE_DIR: Optional[Path] = None
 DOCUMENT_STORE: Dict[str, pymupdf.Document] = {}
 
 
+def fitting_fontsize(rect, text: str, fontname: str = "helv", max_size: float = 11.0) -> float:
+    """The largest fontsize (capped at max_size) at which text fits rect on one line."""
+    width_per_point = pymupdf.get_text_length(text, fontname=fontname, fontsize=1.0)
+    if width_per_point <= 0:
+        return max_size
+    fits_width = (rect.width / width_per_point) * 0.95
+    # insert_textbox needs one line of height at fontsize * 1.2
+    fits_height = (rect.height / 1.2) * 0.95
+    return max(0.1, min(max_size, fits_width, fits_height))
+
+
+def insert_overlay_text(
+    page: "pymupdf.Page",
+    rect,
+    text: str,
+    color: Tuple[float, float, float] = (0, 0, 0),
+) -> bool:
+    """Draw overlay text into a redacted rectangle, shrinking until it fits.
+
+    apply_redactions draws overlay text itself, but its retry loop has a hard
+    floor at fontsize 4 (`while rc < 0 and fsize >= 4`), below which the text is
+    silently dropped — a narrow redaction loses its marker entirely. Markers only
+    need to survive extraction, so they are drawn here after the apply instead,
+    shrinking as far as needed.
+    """
+    r = pymupdf.Rect(rect)
+    fontsize = fitting_fontsize(r, text)
+    while fontsize >= 0.2:
+        rc = page.insert_textbox(r, text, fontname="helv", fontsize=fontsize, color=color)
+        if rc >= 0:
+            return True
+        fontsize = fontsize / 2
+    return False
+
+
 def add_redact_annot_no_box(
     page: "pymupdf.Page",
     rect,
@@ -53,6 +88,7 @@ def add_redact_annot_no_box(
     up if the document is rendered or saved before apply_redactions. Applied
     redactions render from the /IC (fill) and /OverlayText entries, not from
     this preview, so blanking it does not change the redacted output.
+
     """
     annot = page.add_redact_annot(
         rect, text=text, fill=fill, text_color=text_color, cross_out=False
@@ -556,11 +592,13 @@ def redact_by_coordinates(
 
             text_pending = pending[page_num][True]
             if text_pending:
-                for rect, redact_text in text_pending:
+                # text=None on the annotation: apply_redactions' own overlay pass
+                # has a hard fontsize-4 floor and silently drops markers that do
+                # not fit — they are drawn after the applies by insert_overlay_text.
+                for rect, _ in text_pending:
                     add_redact_annot_no_box(
                         page,
                         rect,
-                        text=redact_text,
                         fill=fill_color
                     )
                 # The glyphs under the rectangle go. The page's pictures and line
@@ -574,11 +612,10 @@ def redact_by_coordinates(
 
             region_pending = pending[page_num][False]
             if region_pending:
-                for rect, redact_text in region_pending:
+                for rect, _ in region_pending:
                     add_redact_annot_no_box(
                         page,
                         rect,
-                        text=redact_text,
                         fill=fill_color
                     )
                 # Pixels go and glyphs stay. IMAGE_PIXELS rewrites the picture with
@@ -591,6 +628,11 @@ def redact_by_coordinates(
                     images=pymupdf.PDF_REDACT_IMAGE_PIXELS,
                     graphics=pymupdf.PDF_REDACT_LINE_ART_REMOVE_IF_COVERED
                 )
+
+            # Overlays after both applies, over the cleared rectangles
+            for rect, redact_text in [*text_pending, *region_pending]:
+                if redact_text:
+                    insert_overlay_text(page, rect, redact_text)
 
         result = {
             "document_id": document_id,
