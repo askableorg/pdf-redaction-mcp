@@ -8,6 +8,7 @@ This MCP server provides tools for:
 - Verifying redactions
 """
 
+import sys
 import warnings
 import pymupdf
 import re
@@ -35,6 +36,34 @@ PDF_BASE_DIR: Optional[Path] = None
 # In-memory document store for session-based operations
 # Maps document_id -> pymupdf.Document
 DOCUMENT_STORE: Dict[str, pymupdf.Document] = {}
+
+
+def add_redact_annot_no_box(
+    page: "pymupdf.Page",
+    rect,
+    text: Optional[str] = None,
+    fill: Optional[Tuple[float, float, float]] = None,
+    text_color: Optional[Tuple[float, float, float]] = None,
+) -> "pymupdf.Annot":
+    """Add a redaction annotation without the visible box preview.
+
+    pymupdf's add_redact_annot leaves the annotation with an appearance stream
+    drawn by MuPDF — a red rectangle outline — and adds cross-out diagonals on
+    top. That preview only matters while the redaction is pending, but it shows
+    up if the document is rendered or saved before apply_redactions. Applied
+    redactions render from the /IC (fill) and /OverlayText entries, not from
+    this preview, so blanking it does not change the redacted output.
+    """
+    annot = page.add_redact_annot(
+        rect, text=text, fill=fill, text_color=text_color, cross_out=False
+    )
+    try:
+        annot._setAP(b" ", 0)
+    except Exception:
+        # _setAP is a private pymupdf API; if it ever disappears the redaction
+        # still works, only the pending-state preview box comes back.
+        pass
+    return annot
 
 
 def resolve_pdf_path(pdf_path: str) -> str:
@@ -404,7 +433,8 @@ def redact_text_by_search(
                 
                 for rect in rects:
                     # Add redaction annotation
-                    page.add_redact_annot(
+                    add_redact_annot_no_box(
+                        page,
                         rect,
                         text=overlay_text,
                         fill=fill_color,
@@ -491,7 +521,8 @@ def redact_by_coordinates(
             page = doc[page_num]
             rect = pymupdf.Rect(bbox)
             
-            page.add_redact_annot(
+            add_redact_annot_no_box(
+                page,
                 rect,
                 text=redact_text,
                 fill=fill_color
@@ -569,7 +600,8 @@ def redact_images_in_pdf(
                     continue
                 
                 # Add redaction annotation
-                page.add_redact_annot(
+                add_redact_annot_no_box(
+                    page,
                     bbox,
                     text=overlay_text,
                     fill=fill_color,
@@ -796,14 +828,16 @@ Examples:
     global PDF_BASE_DIR
     if args.pdf_dir:
         PDF_BASE_DIR = Path(args.pdf_dir).resolve()
+        # stderr: in stdio mode stdout carries the JSON-RPC stream, so any
+        # diagnostic printed there corrupts the protocol
         if not PDF_BASE_DIR.exists():
-            print(f"Warning: PDF base directory does not exist: {PDF_BASE_DIR}")
+            print(f"Warning: PDF base directory does not exist: {PDF_BASE_DIR}", file=sys.stderr)
         else:
-            print(f"PDF base directory: {PDF_BASE_DIR}")
-    
+            print(f"PDF base directory: {PDF_BASE_DIR}", file=sys.stderr)
+
     # Run server with appropriate transport
     if args.transport == "stdio":
-        print("Starting PDF Redaction MCP Server in STDIO mode...")
+        print("Starting PDF Redaction MCP Server in STDIO mode...", file=sys.stderr)
         mcp.run()
     elif args.transport in ("http", "sse"):
         print(f"Starting PDF Redaction MCP Server in {args.transport.upper()} mode...")
