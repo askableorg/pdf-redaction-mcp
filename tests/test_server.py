@@ -28,7 +28,9 @@ def test_tools_registered():
         "redact_images_in_pdf",
         "verify_redactions",
         "get_pdf_info",
-        "list_vector_drawings"
+        "list_vector_drawings",
+        "render_page",
+        "list_image_placements"
     ]
     
     # Get all tool definitions from the MCP server
@@ -502,6 +504,159 @@ def test_list_vector_drawings_omits_path_points():
     for drawing in result["drawings"]:
         assert "items" not in drawing
         assert "item_count" in drawing
+
+    server.DOCUMENT_STORE.clear()
+
+
+def _render_fn():
+    from pdf_redaction_mcp import server
+
+    fn = server.render_page
+    return fn.fn if hasattr(fn, "fn") else fn
+
+
+def _placements_fn():
+    from pdf_redaction_mcp import server
+
+    fn = server.list_image_placements
+    return fn.fn if hasattr(fn, "fn") else fn
+
+
+def _make_picture_doc():
+    """One page: text at the top, a placed raster image lower down.
+
+    The picture stands in for a scan or screenshot holding a value — content
+    that answers to neither text search nor vector listing, which is the case
+    render_page and list_image_placements exist for.
+    """
+    import pymupdf
+
+    image_doc = pymupdf.open()
+    image_page = image_doc.new_page(width=100, height=60)
+    image_page.draw_rect(
+        pymupdf.Rect(0, 0, 100, 60), color=(0, 0, 0), fill=(0.2, 0.4, 0.8)
+    )
+    png = image_page.get_pixmap().tobytes("png")
+    image_doc.close()
+
+    doc = pymupdf.open()
+    page = doc.new_page(width=300, height=200)
+    page.insert_text((30, 40), "COVER LETTER", fontsize=14, color=(0, 0, 0))
+    page.insert_image(
+        pymupdf.Rect(50, 80, 250, 180), stream=png, keep_proportion=False
+    )
+    return doc
+
+
+def test_render_page_error_handling():
+    """Missing documents and out-of-range pages answer as JSON errors."""
+    from pdf_redaction_mcp import server
+
+    result = json.loads(_render_fn()(document_id="nonexistent_doc", page_number=0))
+    assert "error" in result
+    assert "not found" in result["error"].lower()
+
+    server.DOCUMENT_STORE.clear()
+    server.DOCUMENT_STORE["pic_doc"] = _make_picture_doc()
+
+    result = json.loads(_render_fn()(document_id="pic_doc", page_number=5))
+    assert "error" in result
+    assert "invalid page" in result["error"].lower()
+
+    server.DOCUMENT_STORE.clear()
+
+
+def test_render_page_returns_metadata_and_png():
+    """Two blocks: the pixel-to-point mapping, then a PNG that reopens."""
+    import pymupdf
+    from pdf_redaction_mcp import server
+
+    server.DOCUMENT_STORE.clear()
+    server.DOCUMENT_STORE["pic_doc"] = _make_picture_doc()
+
+    blocks = _render_fn()(document_id="pic_doc", page_number=0, dpi=144)
+    assert len(blocks) == 2
+
+    metadata = json.loads(blocks[0])
+    assert metadata["page"] == 0
+    assert metadata["page_width_pt"] == 300
+    assert metadata["scale"] == pytest.approx(2.0)
+    assert metadata["image_width_px"] == 600
+
+    rendered = pymupdf.Pixmap(blocks[1].data)
+    assert (rendered.width, rendered.height) == (600, 400)
+
+    server.DOCUMENT_STORE.clear()
+
+
+def test_render_page_caps_oversized_renders():
+    """A poster-sized page cannot produce an image too large to look at."""
+    import pymupdf
+    from pdf_redaction_mcp import server
+
+    doc = pymupdf.open()
+    doc.new_page(width=2000, height=1000)
+    server.DOCUMENT_STORE.clear()
+    server.DOCUMENT_STORE["poster"] = doc
+
+    blocks = _render_fn()(document_id="poster", page_number=0, dpi=300)
+    metadata = json.loads(blocks[0])
+
+    assert metadata["image_width_px"] <= server.RENDER_MAX_SIDE_PX
+    # The reported scale must describe the capped render, not the request.
+    assert metadata["scale"] == pytest.approx(
+        metadata["image_width_px"] / metadata["page_width_pt"], rel=0.01
+    )
+
+    server.DOCUMENT_STORE.clear()
+
+
+def test_list_image_placements_error_handling():
+    """Test error handling for placements on a non-existent document."""
+    result = json.loads(_placements_fn()(document_id="nonexistent_doc"))
+
+    assert "error" in result
+    assert "not found" in result["error"].lower()
+
+
+def test_list_image_placements_sites_the_picture():
+    """The placement bbox is the rectangle a whole-image redaction needs."""
+    from pdf_redaction_mcp import server
+
+    doc = _make_picture_doc()
+    server.DOCUMENT_STORE.clear()
+    server.DOCUMENT_STORE["pic_doc"] = doc
+
+    # Text search cannot see into the picture; this is the tool that can say
+    # where it sits.
+    result = json.loads(_placements_fn()(document_id="pic_doc"))
+
+    assert result["total_placements"] == 1
+    placement = result["placements"][0]
+    assert placement["page"] == 0
+
+    x0, y0, x1, y1 = placement["bbox"]
+    assert (x0, y0, x1, y1) == pytest.approx((50, 80, 250, 180), abs=1)
+    assert placement["source_width_px"] == 100
+    assert "pixels" not in placement
+
+    server.DOCUMENT_STORE.clear()
+
+
+def test_list_image_placements_reports_what_it_dropped():
+    """A truncated or filtered answer must never read as the whole page."""
+    from pdf_redaction_mcp import server
+
+    doc = _make_picture_doc()
+    server.DOCUMENT_STORE.clear()
+    server.DOCUMENT_STORE["pic_doc"] = doc
+
+    filtered = json.loads(
+        _placements_fn()(document_id="pic_doc", min_width=500.0)
+    )
+    assert filtered["total_placements"] == 1
+    assert filtered["matched_filter"] == 0
+    assert filtered["placements"] == []
 
     server.DOCUMENT_STORE.clear()
 

@@ -15,6 +15,9 @@ This MCP server enables LLMs to:
 - **Redact images** - remove images from PDFs with customisable overlays
 - **Verify redactions** - confirm that sensitive information has been properly removed
 - **Get PDF information** - retrieve metadata and structure information
+- **Locate vector drawings** - find handwritten signatures and other ink by bounding box
+- **Render pages as images** - see picture content that text search and vector listing cannot reach
+- **Locate placed images** - the page rectangle of each raster image, ready to redact
 
 ## Installation
 
@@ -322,6 +325,60 @@ load_pdf(pdf_path="/path/to/document.pdf", document_id="doc1")
 
 # Get PDF information
 get_pdf_info(document_id="doc1")
+```
+
+#### 12. `list_vector_drawings`
+
+List vector drawing paths (handwritten signatures, initials, drawn logos) with their bounding boxes. These carry no text and are not images, so neither `search_text_in_pdf` nor `redact_images_in_pdf` can see them.
+
+**Parameters:**
+- `document_id` (str): Identifier of the loaded document
+- `page_number` (int, optional): Specific page (0-indexed). If None, scans all pages
+- `min_width` (float): Skip paths narrower than this, in points
+- `min_height` (float): Skip paths shorter than this, in points
+- `limit` (int): Maximum paths to return, largest area first
+
+**Example:**
+```python
+# A signature is tens of points tall; table rules are hairline thin.
+list_vector_drawings(document_id="doc1", min_width=20.0, min_height=10.0)
+```
+
+#### 13. `render_page`
+
+Render one page as a PNG so content inside pictures can be seen and sited. Returns a JSON metadata block (with the pixel-to-point `scale`) followed by the image. Renders the current in-memory state, so a render after `redact_by_coordinates` shows the redacted page.
+
+**Parameters:**
+- `document_id` (str): Identifier of the loaded document
+- `page_number` (int): Page to render (0-indexed)
+- `dpi` (int): Render resolution, clamped to 36-300 (default 110); long side capped at 4000px
+
+**Example:**
+```python
+# Look at the page, find the region, then convert pixels to points:
+# bbox_pt = [x / scale for x in bbox_px]
+render_page(document_id="doc1", page_number=0)
+```
+
+#### 14. `list_image_placements`
+
+List each placed raster image with its page rectangle in PDF points - already the rectangle `redact_by_coordinates` needs. Returns rectangles and dimensions, never the image's pixels.
+
+**Parameters:**
+- `document_id` (str): Identifier of the loaded document
+- `page_number` (int, optional): Specific page (0-indexed). If None, scans all pages
+- `min_width` (float): Skip placements narrower than this, in points
+- `min_height` (float): Skip placements shorter than this, in points
+- `limit` (int): Maximum placements to return, largest area first
+
+**Example:**
+```python
+# Clear a whole picture: send its bbox as a region redaction.
+placements = list_image_placements(document_id="doc1", page_number=0)
+redact_by_coordinates(
+    document_id="doc1",
+    redactions=[{"page": 0, "bbox": placements_bbox, "remove_text": False}],
+)
 ```
 
 ---

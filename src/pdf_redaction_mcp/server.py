@@ -18,6 +18,7 @@ import argparse
 from pathlib import Path
 from typing import List, Dict, Any, Literal, Optional, Tuple, Union
 from fastmcp import FastMCP
+from fastmcp.utilities.types import Image as FastMCPImage
 from starlette.middleware.cors import CORSMiddleware
 from starlette.middleware import Middleware
 
@@ -1023,6 +1024,168 @@ def list_vector_drawings(
             "returned": len(returned),
             "omitted_by_limit": len(matched) - len(returned),
             "drawings": returned,
+        }
+
+        return json.dumps(result, indent=2)
+
+    except Exception as e:
+        return json.dumps({"error": str(e)})
+
+
+# The long side of a render is capped so an oversized page (a poster, a
+# scanned plan) cannot produce an image too large to look at. 4000px keeps an
+# A4 render comfortably above reading resolution.
+RENDER_MAX_SIDE_PX = 4000
+
+
+@mcp.tool()
+def render_page(
+    document_id: str,
+    page_number: int,
+    dpi: int = 110,
+):
+    """Render one page of a loaded PDF as a PNG, so its pictures can be seen.
+
+    A value embedded inside a picture — a scan, a photograph, a screenshot —
+    carries no text for search_text_in_pdf and is not a vector path for
+    list_vector_drawings, so nothing else in this toolset can say where on the
+    page it sits. Looking at the page is the only way to site it. Use
+    list_image_placements for the rectangles of whole placed pictures; use this
+    to see *inside* one and derive a tighter rectangle.
+
+    Renders the document's current in-memory state, so a second render after
+    redact_by_coordinates shows what the redacted page actually looks like —
+    visual verification for exactly the content verify_redactions cannot check.
+
+    Returns two content blocks: a JSON text block with the mapping metadata,
+    then the PNG. Image pixels map back to PDF points by dividing by `scale`
+    from the metadata: bbox_pt = [x/scale for x in bbox_px]. Send
+    redact_by_coordinates points, never raw pixels.
+
+    Args:
+        document_id: Identifier of the loaded document
+        page_number: Page to render (0-indexed)
+        dpi: Render resolution, clamped to 36–300 (default 110). The long side
+            is additionally capped at 4000px, and `scale` in the metadata
+            reflects whatever was actually rendered.
+    """
+    try:
+        if document_id not in DOCUMENT_STORE:
+            return json.dumps({
+                "error": f"Document '{document_id}' not found. Use load_pdf first.",
+                "available_documents": list(DOCUMENT_STORE.keys())
+            })
+
+        doc = DOCUMENT_STORE[document_id]
+
+        if page_number < 0 or page_number >= len(doc):
+            return json.dumps({
+                "error": f"Invalid page number {page_number}. Document has {len(doc)} pages."
+            })
+
+        page = doc[page_number]
+        rect = page.rect
+
+        zoom = max(36, min(300, dpi)) / 72.0
+        long_side_pt = max(rect.width, rect.height)
+        if long_side_pt * zoom > RENDER_MAX_SIDE_PX:
+            zoom = RENDER_MAX_SIDE_PX / long_side_pt
+
+        pixmap = page.get_pixmap(matrix=pymupdf.Matrix(zoom, zoom))
+
+        metadata = json.dumps({
+            "document_id": document_id,
+            "page": page_number,
+            "page_width_pt": rect.width,
+            "page_height_pt": rect.height,
+            "image_width_px": pixmap.width,
+            "image_height_px": pixmap.height,
+            # Pixels per point. Divide a pixel coordinate by this to get the
+            # PDF point redact_by_coordinates expects.
+            "scale": zoom,
+        }, indent=2)
+
+        return [metadata, FastMCPImage(data=pixmap.tobytes("png"), format="png")]
+
+    except Exception as e:
+        return json.dumps({"error": str(e)})
+
+
+@mcp.tool()
+def list_image_placements(
+    document_id: str,
+    page_number: Optional[int] = None,
+    min_width: float = 0.0,
+    min_height: float = 0.0,
+    limit: int = 100
+) -> str:
+    """List each placed raster image in a loaded PDF with its page rectangle.
+
+    The bbox is where the picture sits on the page, in PDF points — already the
+    rectangle redact_by_coordinates needs. To clear a whole picture, send its
+    bbox with remove_text=false; to clear part of one (a face in a scan, a name
+    in a screenshot), render_page the page, find the region, and narrow the
+    rectangle before sending it.
+
+    get_pdf_info counts a page's images; this is the tool that says where they
+    are. Returns rectangles and dimensions, never the image's pixels.
+
+    Args:
+        document_id: Identifier of the loaded document
+        page_number: Specific page (0-indexed). If None, scans all pages
+        min_width: Skip placements narrower than this, in points
+        min_height: Skip placements shorter than this, in points
+        limit: Maximum placements to return, largest area first
+
+    Returns:
+        JSON string with one entry per placement: page, bbox, dimensions in
+        points, and the source image's pixel dimensions. Counts of what was
+        filtered and dropped are included so a partial answer is never mistaken
+        for the whole.
+    """
+    try:
+        if document_id not in DOCUMENT_STORE:
+            return json.dumps({
+                "error": f"Document '{document_id}' not found. Use load_pdf first.",
+                "available_documents": list(DOCUMENT_STORE.keys())
+            })
+
+        doc = DOCUMENT_STORE[document_id]
+        pages_to_scan = [page_number] if page_number is not None else range(len(doc))
+
+        total_placements = 0
+        matched = []
+
+        for page_num in pages_to_scan:
+            page = doc[page_num]
+
+            for info in page.get_image_info(xrefs=True):
+                total_placements += 1
+                rect = pymupdf.Rect(info["bbox"])
+
+                if rect.width < min_width or rect.height < min_height:
+                    continue
+
+                matched.append({
+                    "page": page_num,
+                    "bbox": list(rect),
+                    "width": rect.width,
+                    "height": rect.height,
+                    "source_width_px": info.get("width"),
+                    "source_height_px": info.get("height"),
+                    "xref": info.get("xref"),
+                })
+
+        matched.sort(key=lambda p: p["width"] * p["height"], reverse=True)
+        returned = matched[:limit]
+
+        result = {
+            "document_id": document_id,
+            "total_placements": total_placements,
+            "matched_filter": len(matched),
+            "returned": len(returned),
+            "omitted_by_limit": len(matched) - len(returned),
+            "placements": returned,
         }
 
         return json.dumps(result, indent=2)
