@@ -27,7 +27,8 @@ def test_tools_registered():
         "redact_by_coordinates",
         "redact_images_in_pdf",
         "verify_redactions",
-        "get_pdf_info"
+        "get_pdf_info",
+        "list_vector_drawings"
     ]
     
     # Get all tool definitions from the MCP server
@@ -252,6 +253,255 @@ def test_text_redaction_still_fills_and_overlays():
         pymupdf.Rect(30, 100, 150, 140) in [item[1] for item in d["items"]]
         for d in page.get_drawings()
     )
+
+    server.DOCUMENT_STORE.clear()
+
+
+def _redact_fn():
+    from pdf_redaction_mcp import server
+
+    fn = server.redact_by_coordinates
+    return fn.fn if hasattr(fn, "fn") else fn
+
+
+def _ink_paths(page):
+    """Stroked, curve-heavy paths — the signature, not the rules."""
+    return [
+        d for d in page.get_drawings()
+        if d["type"] == "s" and len(d["items"]) > 5
+    ]
+
+
+def test_region_redaction_leaves_ink_standing():
+    """The bug remove_line_art exists for, pinned so it cannot come back silently.
+
+    A region redaction removes only vector art it counts as *covered*, and that test
+    does not fire on a long run of bezier curves. The paint lands and the path
+    survives underneath: visually gone, recoverable in full from the content stream.
+    Measured on a real signature, a rectangle enclosing the whole of the path's
+    reported bounding box still left it in place.
+    """
+    from pdf_redaction_mcp import server
+
+    doc = _make_signature_doc()
+    server.DOCUMENT_STORE.clear()
+    server.DOCUMENT_STORE["sig_doc"] = doc
+
+    assert len(_ink_paths(doc[0])) == 1
+
+    # Generous: wider and taller than the ink on every side.
+    result = json.loads(_redact_fn()(
+        document_id="sig_doc",
+        redactions=[{"page": 0, "bbox": [80, 100, 240, 195], "remove_text": False}],
+    ))
+    assert result["total_redactions"] == 1
+
+    assert len(_ink_paths(doc[0])) == 1, "region redaction unexpectedly removed the ink"
+
+    server.DOCUMENT_STORE.clear()
+
+
+def test_remove_line_art_removes_the_ink():
+    """remove_line_art is what actually takes a signature out of the content stream."""
+    from pdf_redaction_mcp import server
+
+    doc = _make_signature_doc()
+    server.DOCUMENT_STORE.clear()
+    server.DOCUMENT_STORE["sig_doc"] = doc
+
+    assert len(_ink_paths(doc[0])) == 1
+
+    result = json.loads(_redact_fn()(
+        document_id="sig_doc",
+        redactions=[{
+            "page": 0,
+            "bbox": [95, 105, 220, 185],
+            "remove_text": False,
+            "remove_line_art": True,
+        }],
+    ))
+    assert result["total_redactions"] == 1
+    assert result["redactions"][0]["remove_line_art"] is True
+
+    assert _ink_paths(doc[0]) == [], "the signature is still in the content stream"
+
+    server.DOCUMENT_STORE.clear()
+
+
+def test_remove_line_art_is_refused_with_remove_text():
+    """The text pass preserves vector art by design; the pair describes no pass."""
+    from pdf_redaction_mcp import server
+
+    doc = _make_signature_doc()
+    server.DOCUMENT_STORE.clear()
+    server.DOCUMENT_STORE["sig_doc"] = doc
+
+    result = json.loads(_redact_fn()(
+        document_id="sig_doc",
+        redactions=[{
+            "page": 0,
+            "bbox": [95, 105, 220, 185],
+            "remove_text": True,
+            "remove_line_art": True,
+        }],
+    ))
+
+    assert result["total_redactions"] == 0
+    assert result["redactions"][0]["status"] == "error"
+    assert "remove_text=false" in result["redactions"][0]["message"]
+    assert len(_ink_paths(doc[0])) == 1
+
+    server.DOCUMENT_STORE.clear()
+
+
+def test_remove_line_art_spares_art_it_does_not_touch():
+    """Destructive in proportion to the rectangle, and no further.
+
+    IF_TOUCHED takes everything the rectangle clips, which is the cost of reaching
+    the ink. What it must not do is reach past its own bounds.
+    """
+    from pdf_redaction_mcp import server
+
+    doc = _make_signature_doc()
+    server.DOCUMENT_STORE.clear()
+    server.DOCUMENT_STORE["sig_doc"] = doc
+
+    # The rule sits at y=60; the ink runs from y~110 down. This clears only the ink.
+    _redact_fn()(
+        document_id="sig_doc",
+        redactions=[{
+            "page": 0,
+            "bbox": [95, 105, 220, 185],
+            "remove_text": False,
+            "remove_line_art": True,
+        }],
+    )
+
+    survivors = doc[0].get_drawings()
+    assert _ink_paths(doc[0]) == []
+    # The rule is untouched: some path still spans the page at its height.
+    assert any(
+        d["rect"].y0 < 65 and d["rect"].width > 200 for d in survivors
+    ), "the rule outside the rectangle was destroyed"
+
+    server.DOCUMENT_STORE.clear()
+
+
+def _drawings_fn():
+    from pdf_redaction_mcp import server
+
+    fn = server.list_vector_drawings
+    return fn.fn if hasattr(fn, "fn") else fn
+
+
+def test_list_vector_drawings_error_handling():
+    """Test error handling for drawings on a non-existent document."""
+    result = json.loads(_drawings_fn()(document_id="nonexistent_doc"))
+
+    assert "error" in result
+    assert "not found" in result["error"].lower()
+
+
+def _make_signature_doc():
+    """One page: a hairline rule, and a stroked squiggle standing in for ink.
+
+    Many bezier segments whose control points sit well outside the curve they
+    draw, because that is both what handwriting looks like and the property that
+    makes a region redaction's "covered" test miss it.
+    """
+    import pymupdf
+
+    doc = pymupdf.open()
+    page = doc.new_page(width=300, height=200)
+
+    # A table rule: long, no height, one segment. The kind of path that is noise.
+    page.draw_line(pymupdf.Point(20, 60), pymupdf.Point(280, 60), width=0.5)
+
+    shape = page.new_shape()
+    x, baseline, reach = 100.0, 150.0, 55.0
+    for segment in range(8):
+        next_x = x + 14.5
+        offset = -reach if segment % 2 == 0 else reach
+        shape.draw_bezier(
+            pymupdf.Point(x, baseline),
+            pymupdf.Point(x + 4, baseline + offset),
+            pymupdf.Point(next_x - 4, baseline + offset),
+            pymupdf.Point(next_x, baseline),
+        )
+        x = next_x
+    shape.finish(color=(0, 0, 0), width=1.5)
+    shape.commit()
+
+    return doc
+
+
+def test_list_vector_drawings_finds_a_stroked_signature():
+    """The signature case: ink that carries no text and is not an image.
+
+    This is what search_text_in_pdf and redact_images_in_pdf both miss, and the
+    reason this tool exists — the bbox it returns is what redact_by_coordinates
+    needs to clear the signature.
+    """
+    from pdf_redaction_mcp import server
+
+    doc = _make_signature_doc()
+    server.DOCUMENT_STORE.clear()
+    server.DOCUMENT_STORE["sig_doc"] = doc
+
+    # Neither of the other locators can see it.
+    assert doc[0].get_text().strip() == ""
+    assert len(doc[0].get_images()) == 0
+
+    everything = json.loads(_drawings_fn()(document_id="sig_doc"))
+    assert everything["total_paths"] >= 2
+
+    # Filtering on height alone separates the signature from the rule.
+    filtered = json.loads(_drawings_fn()(document_id="sig_doc", min_height=10.0))
+    assert filtered["matched_filter"] == 1
+
+    signature = filtered["drawings"][0]
+    assert signature["page"] == 0
+    assert signature["type"] == "s"
+    assert signature["item_kinds"].get("c", 0) >= 2
+
+    # The bbox covers the drawn stroke, which is what a redaction is aimed at.
+    x0, y0, x1, y1 = signature["bbox"]
+    assert x0 <= 100 and x1 >= 215
+    assert y1 > y0 + 10
+
+    server.DOCUMENT_STORE.clear()
+
+
+def test_list_vector_drawings_reports_what_it_dropped():
+    """A truncated answer must never read as the whole page."""
+    from pdf_redaction_mcp import server
+
+    doc = _make_signature_doc()
+    server.DOCUMENT_STORE.clear()
+    server.DOCUMENT_STORE["sig_doc"] = doc
+
+    result = json.loads(_drawings_fn()(document_id="sig_doc", limit=1))
+
+    assert result["returned"] == 1
+    assert result["omitted_by_limit"] == result["matched_filter"] - 1
+    assert result["total_paths"] >= result["matched_filter"]
+
+    server.DOCUMENT_STORE.clear()
+
+
+def test_list_vector_drawings_omits_path_points():
+    """The point coordinates are the drawing; a bbox is enough to redact it."""
+    from pdf_redaction_mcp import server
+
+    doc = _make_signature_doc()
+    server.DOCUMENT_STORE.clear()
+    server.DOCUMENT_STORE["sig_doc"] = doc
+
+    result = json.loads(_drawings_fn()(document_id="sig_doc"))
+
+    for drawing in result["drawings"]:
+        assert "items" not in drawing
+        assert "item_count" in drawing
 
     server.DOCUMENT_STORE.clear()
 

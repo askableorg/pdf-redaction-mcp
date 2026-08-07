@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""Run the PDF Redaction MCP Server in HTTP/SSE mode for remote deployment.
+"""Run the PDF Redaction MCP Server in streamable HTTP mode for remote deployment.
 
-This script starts the server in HTTP/SSE mode, suitable for:
+This script starts the server in streamable HTTP mode, suitable for:
 - Remote MCP connections
 - Web-based clients
 
@@ -18,7 +18,7 @@ from pdf_redaction_mcp.server import mcp
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Run PDF Redaction MCP Server in HTTP/SSE mode"
+        description="Run PDF Redaction MCP Server in streamable HTTP mode"
     )
     parser.add_argument(
         "--port",
@@ -36,7 +36,7 @@ def main():
     args = parser.parse_args()
     
     print(f"Starting PDF Redaction MCP Server")
-    print(f"Mode: HTTP/SSE (Server-Sent Events)")
+    print(f"Mode: Streamable HTTP")
     print(f"Host: {args.host}")
     print(f"Port: {args.port}")
     print(f"URL: http://{args.host}:{args.port}/mcp")
@@ -47,13 +47,13 @@ def main():
     print("Compatible with:")
     print("  • Claude Desktop")
     print("  • Cursor IDE")
-    print("  • Any MCP client with STDIO/HTTP/SSE transport")
+    print("  • Any MCP client with STDIO/HTTP transport")
     print()
     print("Press Ctrl+C to stop the server")
     print("-" * 60)
     
     # Run the server
-    mcp.run(transport="sse", port=args.port, host=args.host)
+    mcp.run(transport="http", port=args.port, host=args.host)
 
 
 if __name__ == "__main__":

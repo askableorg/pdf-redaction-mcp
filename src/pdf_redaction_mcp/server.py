@@ -529,6 +529,14 @@ def redact_by_coordinates(
               image is cleared and covered vector art is removed, while every glyph
               the rectangle overlaps is left standing — the rectangle is about the
               page's pixels, and the text it happens to cross belongs to no removal.
+            - remove_line_art: Optional bool, default False. Requires remove_text=false.
+              Removes every vector path the rectangle *touches*, rather than only those
+              it wholly covers. Needed for handwritten ink: a region redaction's covered
+              test does not fire reliably on a long run of bezier curves — observed on
+              real signatures, with the rectangle enclosing the path's whole reported
+              bounding box and the path still surviving under the paint. Destructive in
+              proportion to the rectangle: any rule, border or underline it clips goes
+              too, so send the tightest rectangle around the ink and no more.
         fill_color: RGB color for redaction box (0-1 range). Default is black (0,0,0).
             Applies to text redactions only: their cleared rectangle is painted with
             this colour. Region redactions are never filled — painting the rectangle
@@ -548,17 +556,18 @@ def redact_by_coordinates(
         doc = DOCUMENT_STORE[document_id]
         applied_redactions = []
 
-        # Pending annotations per page, split by remove_text. The two kinds are
-        # applied in separate passes with different modes, and apply_redactions
+        # Pending annotations per page, split by the pass that will apply them. The
+        # three kinds run separately with different modes, and apply_redactions
         # consumes every annotation pending on the page, so they cannot be added
         # to the page together.
-        pending: Dict[int, Dict[bool, List[Tuple[Any, Optional[str]]]]] = {}
+        pending: Dict[int, Dict[str, List[Tuple[Any, Optional[str]]]]] = {}
 
         for redaction in redactions:
             page_num = redaction.get("page", 0)
             bbox = redaction.get("bbox")
             redact_text = redaction.get("text", overlay_text)
             remove_text = redaction.get("remove_text", True)
+            remove_line_art = redaction.get("remove_line_art", False)
 
             if page_num < 0 or page_num >= len(doc):
                 applied_redactions.append({
@@ -583,13 +592,32 @@ def redact_by_coordinates(
                 })
                 continue
 
-            per_page = pending.setdefault(page_num, {True: [], False: []})
-            per_page[remove_text].append((pymupdf.Rect(bbox), redact_text))
+            if not isinstance(remove_line_art, bool):
+                applied_redactions.append({
+                    "status": "error",
+                    "message": "Invalid remove_line_art. Expected true or false"
+                })
+                continue
+
+            # Refused rather than reconciled: the text pass preserves vector art by
+            # design, so the two together describe no pass this tool has. Asking for
+            # both means sending two rectangles and saying which does what.
+            if remove_line_art and remove_text:
+                applied_redactions.append({
+                    "status": "error",
+                    "message": "remove_line_art requires remove_text=false"
+                })
+                continue
+
+            kind = "text" if remove_text else ("ink" if remove_line_art else "region")
+            per_page = pending.setdefault(page_num, {"text": [], "region": [], "ink": []})
+            per_page[kind].append((pymupdf.Rect(bbox), redact_text))
 
             applied_redactions.append({
                 "page": page_num,
                 "bbox": bbox,
                 "remove_text": remove_text,
+                "remove_line_art": remove_line_art,
                 "status": "applied"
             })
 
@@ -597,7 +625,7 @@ def redact_by_coordinates(
         for page_num in sorted(pending):
             page = doc[page_num]
 
-            text_pending = pending[page_num][True]
+            text_pending = pending[page_num]["text"]
             if text_pending:
                 # text=None on the annotation: apply_redactions' own overlay pass
                 # has a hard fontsize-4 floor and silently drops markers that do
@@ -617,7 +645,7 @@ def redact_by_coordinates(
                     graphics=pymupdf.PDF_REDACT_LINE_ART_NONE
                 )
 
-            region_pending = pending[page_num][False]
+            region_pending = pending[page_num]["region"]
             if region_pending:
                 # fill=False, not fill_color and not None: TEXT_NONE leaves the
                 # overlapping glyphs standing, and any /IC fill would paint over
@@ -642,8 +670,31 @@ def redact_by_coordinates(
                     graphics=pymupdf.PDF_REDACT_LINE_ART_REMOVE_IF_COVERED
                 )
 
-            # Overlays after both applies, over the cleared rectangles
-            for rect, redact_text in [*text_pending, *region_pending]:
+            ink_pending = pending[page_num]["ink"]
+            if ink_pending:
+                # fill=False for the region pass's reason: TEXT_NONE leaves the
+                # overlapping glyphs standing and a fill would paint over them.
+                for rect, _ in ink_pending:
+                    add_redact_annot_no_box(
+                        page,
+                        rect,
+                        fill=False
+                    )
+                # REMOVE_IF_TOUCHED, where the region pass uses REMOVE_IF_COVERED.
+                # Covered does not fire on a long run of bezier curves: measured on a
+                # real signature, a rectangle enclosing the whole of the path's
+                # reported bounding box left it in the content stream with the paint
+                # sitting on top — visually gone, recoverable in full. Touched is the
+                # only test that reaches it, and it reaches everything else the
+                # rectangle clips too: that is why this pass is opt-in per redaction.
+                page.apply_redactions(
+                    text=pymupdf.PDF_REDACT_TEXT_NONE,
+                    images=pymupdf.PDF_REDACT_IMAGE_PIXELS,
+                    graphics=pymupdf.PDF_REDACT_LINE_ART_REMOVE_IF_TOUCHED
+                )
+
+            # Overlays after every apply, over the cleared rectangles
+            for rect, redact_text in [*text_pending, *region_pending, *ink_pending]:
                 if redact_text:
                     insert_overlay_text(page, rect, redact_text)
 
@@ -878,7 +929,104 @@ def get_pdf_info(document_id: str) -> str:
             info["page_info"].append(page_info)
         
         return json.dumps(info, indent=2)
-    
+
+    except Exception as e:
+        return json.dumps({"error": str(e)})
+
+
+@mcp.tool()
+def list_vector_drawings(
+    document_id: str,
+    page_number: Optional[int] = None,
+    min_width: float = 0.0,
+    min_height: float = 0.0,
+    limit: int = 100
+) -> str:
+    """List vector drawing paths in a loaded PDF with their bounding boxes.
+
+    Vector paths are ink drawn straight into the page content stream: handwritten
+    signatures, initials, logos drawn as curves, and the rules that make up tables
+    and borders. They carry no text and are not images, so neither
+    search_text_in_pdf nor redact_images_in_pdf can see them. This is the only way
+    to locate one, and a signature that survived an automated redaction pass is
+    usually one of these.
+
+    Returns bounding boxes and shape counts, never the path's point coordinates:
+    those points are the drawing itself — for a signature they are the signature —
+    and a bounding box is all redact_by_coordinates needs.
+
+    Most pages carry many trivial paths (table rules, cell borders, underlines).
+    Filter them with min_width/min_height rather than reading past them: a
+    signature is typically tens of points wide and tall with many curve segments,
+    where a rule is long, hairline thin, and a single item.
+
+    The document must be loaded first using load_pdf.
+
+    Args:
+        document_id: Identifier of the loaded document
+        page_number: Specific page (0-indexed). If None, scans all pages
+        min_width: Skip paths narrower than this, in points
+        min_height: Skip paths shorter than this, in points
+        limit: Maximum paths to return, largest area first
+
+    Returns:
+        JSON string with one entry per path: page, type ('f' filled, 's' stroked,
+        'fs' both), bbox, dimensions, and a count of its segment kinds ('l' line,
+        'c' curve, 're' rectangle, 'qu' quad). Counts of what was filtered and
+        dropped are included so a partial answer is never mistaken for the whole.
+    """
+    try:
+        if document_id not in DOCUMENT_STORE:
+            return json.dumps({
+                "error": f"Document '{document_id}' not found. Use load_pdf first.",
+                "available_documents": list(DOCUMENT_STORE.keys())
+            })
+
+        doc = DOCUMENT_STORE[document_id]
+        pages_to_scan = [page_number] if page_number is not None else range(len(doc))
+
+        total_paths = 0
+        matched = []
+
+        for page_num in pages_to_scan:
+            page = doc[page_num]
+
+            for path in page.get_drawings():
+                total_paths += 1
+                rect = path["rect"]
+
+                if rect.width < min_width or rect.height < min_height:
+                    continue
+
+                item_kinds = {}
+                for item in path["items"]:
+                    item_kinds[item[0]] = item_kinds.get(item[0], 0) + 1
+
+                matched.append({
+                    "page": page_num,
+                    "type": path.get("type"),
+                    "bbox": list(rect),
+                    "width": rect.width,
+                    "height": rect.height,
+                    "item_count": len(path["items"]),
+                    "item_kinds": item_kinds,
+                    "stroke_width": path.get("width"),
+                })
+
+        matched.sort(key=lambda p: p["width"] * p["height"], reverse=True)
+        returned = matched[:limit]
+
+        result = {
+            "document_id": document_id,
+            "total_paths": total_paths,
+            "matched_filter": len(matched),
+            "returned": len(returned),
+            "omitted_by_limit": len(matched) - len(returned),
+            "drawings": returned,
+        }
+
+        return json.dumps(result, indent=2)
+
     except Exception as e:
         return json.dumps({"error": str(e)})
 
